@@ -1,0 +1,57 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-1: #000000;
+  --bg-2: #080808;
+  --ink: #ffffff;
+  --card: rgba(17, 17, 17, 0.84);
+  --line: rgba(212, 175, 55, 0.35);
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 15% 10%, rgba(212, 175, 55, 0.24), transparent 42%),
+    radial-gradient(circle at 80% 0%, rgba(184, 148, 45, 0.18), transparent 48%),
+    linear-gradient(140deg, var(--bg-1), var(--bg-2));
+  color: var(--ink);
+  font-family: "Sora", sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.grain-layer {
+  position: fixed;
+  inset: 0;
+  background-image: radial-gradient(rgba(212, 175, 55, 0.035) 1px, transparent 1px);
+  background-size: 5px 5px;
+  pointer-events: none;
+  z-index: -1;
+}
+
+.glass {
+  background: var(--card);
+  border: 1px solid var(--line);
+  backdrop-filter: blur(8px);
+}
+
+.cta-btn {
+  @apply rounded-xl border border-transparent bg-ember-500 px-4 py-2 font-semibold text-black transition hover:-translate-y-0.5 hover:bg-ember-400;
+}
+
+.ghost-btn {
+  @apply rounded-xl border border-ember-500/70 bg-storm-100/80 px-4 py-2 font-semibold text-ember-500 transition hover:bg-storm-200;
+}
+
+.field {
+  @apply w-full rounded-xl border border-ember-500/40 bg-storm-100 px-3 py-2 text-sm text-storm-900 outline-none transition focus:border-ember-500 focus:ring-2 focus:ring-ember-500/25;
+}
+
+.label {
+  @apply mb-1 block text-xs font-semibold uppercase tracking-wider text-ember-500;
+}
