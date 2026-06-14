@@ -19,8 +19,8 @@ Full-stack multiplayer IPL-style auction platform with real-time bidding and a c
 ## Tech Stack
 
 - Frontend: React, Tailwind CSS, Zustand, Axios, React Router
-- Backend: Node.js, Express, Socket.IO, Mongoose
-- Database: MongoDB
+- Backend: Node.js, Express, Socket.IO, pg
+- Database: Supabase Postgres
 - Identity: Anonymous UUID + room participant records
 
 ## Project Structure
@@ -41,12 +41,12 @@ Full-stack multiplayer IPL-style auction platform with real-time bidding and a c
 │   │   ├── config
 │   │   ├── controllers
 │   │   ├── middleware
-│   │   ├── models
 │   │   ├── routes
 │   │   ├── seed
 │   │   ├── services
 │   │   ├── socket
 │   │   └── utils
+│   ├── supabase
 │   ├── .env.example
 │   └── package.json
 └── package.json
@@ -55,7 +55,7 @@ Full-stack multiplayer IPL-style auction platform with real-time bidding and a c
 ## Prerequisites
 
 - Node.js 18+
-- MongoDB running locally or remotely
+- Supabase project with Postgres enabled
 
 ## Environment Setup
 
@@ -67,11 +67,10 @@ Full-stack multiplayer IPL-style auction platform with real-time bidding and a c
 Server variables:
 
 - `PORT` default `5000`
-- `MONGO_URI` default `mongodb://127.0.0.1:27017/ipl-auction-sim`
-- `MONGO_SERVER_SELECTION_TIMEOUT_MS` default `5000`
-- `MONGO_RETRY_DELAY_MS` retry delay between failed DB attempts (default `5000`)
-- `MONGO_MAX_RETRIES` retries before fallback or failure (default `6` in dev, `0` infinite in production)
-- `MONGO_MEMORY_FALLBACK` fallback to in-memory MongoDB when primary DB is unavailable (default `true` in dev, `false` in production)
+- `SUPABASE_DB_URL` Postgres connection string from Supabase
+- `SUPABASE_DB_SSL` use SSL when connecting to Supabase DB (`true` default)
+- `DB_RETRY_DELAY_MS` retry delay between failed DB attempts (default `5000`)
+- `DB_MAX_RETRIES` retries before failure (default `6` in dev, `0` infinite in production)
 - `CLIENT_ORIGIN` default `http://localhost:5173`
 - `AUCTION_BID_DURATION_MS` bid reset timer (default 15000)
 - `AUCTION_START_BID_DURATION_MS` first-bid timer (default 20000)
@@ -89,19 +88,23 @@ Server variables:
 npm install
 ```
 
-2. Seed sample IPL players
+2. Apply Supabase schema
+
+Run `server/supabase/schema.sql` in Supabase SQL editor.
+
+3. Seed sample IPL players
 
 ```bash
 npm run seed
 ```
 
-3. Start client and server together
+4. Start client and server together
 
 ```bash
 npm run dev
 ```
 
-4. Open apps
+5. Open apps
 
 - Client: http://localhost:5173
 - Server health: http://localhost:5000/health
@@ -124,6 +127,8 @@ npm run dev
 ### Match Simulator
 
 - `POST /match/simulate`
+- `POST /match/playing-eleven`
+- `POST /match/simulate-room`
 
 ### Tournament
 

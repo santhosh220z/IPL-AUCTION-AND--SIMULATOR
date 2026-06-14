@@ -1,6 +1,5 @@
-import { connectDatabase } from "../config/db.js";
+import { closeDatabase, connectDatabase, dbQuery } from "../config/db.js";
 import { env } from "../config/env.js";
-import Player from "../models/Player.js";
 
 const players = [
   { name: "Rohit Sharma", role: "batsman", basePrice: 2000000, battingSkill: 90, bowlingSkill: 20 },
@@ -36,13 +35,46 @@ const players = [
 ];
 
 async function seedPlayers() {
-  await connectDatabase(env.mongoUri);
+  await connectDatabase(env.supabaseDbUrl);
 
-  await Player.deleteMany({});
-  await Player.insertMany(players);
+  await dbQuery(
+    `
+    truncate table
+      team_playing_eleven,
+      team_players,
+      sold_players,
+      unsold_players,
+      room_player_queue,
+      matches,
+      participants,
+      teams,
+      auction_rooms,
+      players
+    cascade
+    `
+  );
+
+  for (const player of players) {
+    // eslint-disable-next-line no-await-in-loop
+    await dbQuery(
+      `
+      insert into players (name, role, base_price, batting_skill, bowling_skill)
+      values ($1, $2, $3, $4, $5)
+      `,
+      [
+        player.name,
+        player.role,
+        player.basePrice,
+        player.battingSkill,
+        player.bowlingSkill
+      ]
+    );
+  }
 
   // eslint-disable-next-line no-console
   console.log(`Seeded ${players.length} players`);
+
+  await closeDatabase();
   process.exit(0);
 }
 

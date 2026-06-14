@@ -1,5 +1,9 @@
 import { pickWeightedOutcome } from "./weightedRandom.js";
 
+function getEntityId(entity) {
+  return String(entity?._id || entity?.id || "");
+}
+
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
@@ -47,8 +51,13 @@ function buildOutcomeWeights(battingSkill, bowlingSkill) {
 function initializeBatterStats(players) {
   const stats = new Map();
   for (const player of players) {
-    stats.set(String(player._id), {
-      playerId: player._id,
+    const playerId = getEntityId(player);
+    if (!playerId) {
+      throw new Error("Missing player id in batting lineup");
+    }
+
+    stats.set(playerId, {
+      playerId,
       name: player.name,
       runs: 0,
       balls: 0,
@@ -63,8 +72,13 @@ function initializeBatterStats(players) {
 function initializeBowlerStats(players) {
   const stats = new Map();
   for (const player of players) {
-    stats.set(String(player._id), {
-      playerId: player._id,
+    const playerId = getEntityId(player);
+    if (!playerId) {
+      throw new Error("Missing player id in bowling lineup");
+    }
+
+    stats.set(playerId, {
+      playerId,
       name: player.name,
       balls: 0,
       runsConceded: 0,
@@ -135,8 +149,14 @@ function runInnings({ battingTeam, bowlingTeam, target = Number.POSITIVE_INFINIT
         buildOutcomeWeights(striker.battingSkill, bowler.bowlingSkill)
       );
 
-      const batter = batterStats.get(String(striker._id));
-      const bowlerStat = bowlerStats.get(String(bowler._id));
+      const batterId = getEntityId(striker);
+      const bowlerId = getEntityId(bowler);
+      const batter = batterStats.get(batterId);
+      const bowlerStat = bowlerStats.get(bowlerId);
+
+      if (!batter || !bowlerStat) {
+        throw new Error("Unable to resolve batter or bowler stats by player id");
+      }
 
       batter.balls += 1;
       bowlerStat.balls += 1;

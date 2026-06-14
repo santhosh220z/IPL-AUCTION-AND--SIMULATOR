@@ -13,7 +13,7 @@ export function SocketProvider({ children }) {
 
   useEffect(() => {
     const newSocket = io(getApiBaseUrl(), {
-      transports: ["websocket"]
+      transports: ["websocket", "polling"]
     });
 
     newSocket.on("connect", () => setConnected(true));

@@ -111,7 +111,7 @@ export default function AuctionRoomPage() {
       }
     };
 
-    socket.on("join_room", applyRoomState);
+
     socket.on("start_auction", applyRoomState);
     socket.on("new_player", applyRoomState);
     socket.on("update_bid", applyRoomState);
@@ -121,7 +121,7 @@ export default function AuctionRoomPage() {
     socket.on("error_message", onError);
 
     return () => {
-      socket.off("join_room", applyRoomState);
+
       socket.off("start_auction", applyRoomState);
       socket.off("new_player", applyRoomState);
       socket.off("update_bid", applyRoomState);
@@ -263,7 +263,15 @@ export default function AuctionRoomPage() {
             </div>
           ) : (
             <p className="text-sm text-storm-700">
-              Waiting for auction to start or complete. Go to <Link className="font-semibold text-ember-500 underline" to="/">home</Link> to host or join a room.
+              {room?.status === "completed" ? (
+                <>
+                  Auction completed. Go to <Link className="font-semibold text-ember-500 underline" to="/match">Match Simulator</Link> to submit your Playing 11 and start tournament simulation.
+                </>
+              ) : (
+                <>
+                  Waiting for auction to start. Go to <Link className="font-semibold text-ember-500 underline" to="/">home</Link> to host or join a room.
+                </>
+              )}
             </p>
           )}
         </Panel>

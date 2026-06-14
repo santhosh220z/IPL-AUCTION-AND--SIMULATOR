@@ -1,28 +1,22 @@
-import mongoose from "mongoose";
 import { env } from "../config/env.js";
-import AuctionRoom from "../models/AuctionRoom.js";
-import Participant from "../models/Participant.js";
-import Player from "../models/Player.js";
-import Team from "../models/Team.js";
+import { dbQuery, withTransaction } from "../config/db.js";
 import { generateRoomCode } from "../utils/generateRoomCode.js";
 import { httpError } from "../utils/httpError.js";
+import {
+  buildRoomPayloadFromRow,
+  countRoomQueue,
+  getParticipantByRoomAndUserId,
+  getRoomByCode,
+  isUuid,
+  normalizeColor,
+  normalizeRoomId,
+  toSafeNumber
+} from "./sqlData.js";
 
 const roomLocks = new Map();
 const roomTimers = new Map();
 
 let ioInstance = null;
-
-const defaultColor = "#D4AF37";
-const hexColorRegex = /^#(?:[0-9a-fA-F]{6})$/;
-
-function normalizeRoomId(roomId) {
-  return String(roomId || "").trim().toUpperCase();
-}
-
-function normalizeColor(color) {
-  const candidate = String(color || "").trim();
-  return hexColorRegex.test(candidate) ? candidate.toUpperCase() : defaultColor;
-}
 
 function requireText(value, fieldName) {
   const result = String(value || "").trim();
@@ -30,126 +24,6 @@ function requireText(value, fieldName) {
     throw httpError(400, `${fieldName} is required`);
   }
   return result;
-}
-
-function serializePlayer(player) {
-  if (!player) return null;
-  return {
-    id: String(player._id),
-    name: player.name,
-    role: player.role,
-    basePrice: player.basePrice,
-    battingSkill: player.battingSkill,
-    bowlingSkill: player.bowlingSkill
-  };
-}
-
-function serializeTeam(team) {
-  const ownerId = String(team.ownerUserId || team.owner?._id || "");
-  const ownerName = team.ownerName || team.owner?.username || "";
-  const color = normalizeColor(team.color);
-
-  return {
-    id: String(team._id),
-    name: team.name,
-    budget: team.budget,
-    spent: team.spent,
-    color,
-    owner: {
-      id: ownerId,
-      username: ownerName,
-      color
-    },
-    ownerUserId: ownerId,
-    ownerName,
-    players: (team.players || []).map(serializePlayer)
-  };
-}
-
-function serializeParticipant(participant) {
-  return {
-    id: String(participant._id),
-    userId: participant.userId,
-    userName: participant.userName,
-    isHost: Boolean(participant.isHost),
-    color: normalizeColor(participant.color),
-    teamId: participant.team ? String(participant.team._id || participant.team) : "",
-    teamName: participant.team?.name || ""
-  };
-}
-
-function buildRoomPayload(room, participants = []) {
-  return {
-    id: String(room._id),
-    roomId: room.roomId,
-    status: room.status,
-    creator: room.creatorUserId,
-    creatorUserId: room.creatorUserId,
-    creatorName: room.creatorName,
-    currentPlayerIndex: room.currentPlayerIndex,
-    queueSize: room.playerQueue?.length || 0,
-    remainingPlayers: Math.max(
-      (room.playerQueue?.length || 0) - (room.currentPlayer ? room.currentPlayerIndex + 1 : room.currentPlayerIndex),
-      0
-    ),
-    bidEndTime: room.bidEndTime,
-    currentPlayer: serializePlayer(room.currentPlayer),
-    highestBid: room.highestBid,
-    highestBidder: room.highestBidder
-      ? {
-          id: String(room.highestBidder._id || room.highestBidder),
-          name: room.highestBidder.name || "",
-          color: normalizeColor(room.highestBidder.color)
-        }
-      : null,
-    teams: (room.teams || []).map(serializeTeam),
-    participants: participants.map(serializeParticipant),
-    soldPlayers:
-      room.soldPlayers?.map((entry) => ({
-        player: serializePlayer(entry.player),
-        team: entry.team
-          ? {
-              id: String(entry.team._id || entry.team),
-              name: entry.team.name || ""
-            }
-          : null,
-        amount: entry.amount
-      })) || [],
-    unsoldPlayers: (room.unsoldPlayers || []).map(serializePlayer)
-  };
-}
-
-async function hydrateRoomByCode(roomId) {
-  return AuctionRoom.findOne({ roomId: normalizeRoomId(roomId) })
-    .populate({
-      path: "teams",
-      populate: [{ path: "players" }]
-    })
-    .populate("currentPlayer")
-    .populate("highestBidder", "name budget color ownerName ownerUserId")
-    .populate("soldPlayers.player")
-    .populate("soldPlayers.team", "name")
-    .populate("unsoldPlayers");
-}
-
-async function getRoomParticipants(roomObjectId) {
-  return Participant.find({ room: roomObjectId })
-    .populate("team", "name color ownerUserId ownerName")
-    .sort({ createdAt: 1 });
-}
-
-async function ensureRoomMembership(room, userId) {
-  const cleanUserId = String(userId || "").trim();
-  if (!cleanUserId) {
-    throw httpError(400, "userId is required");
-  }
-
-  const participant = await Participant.findOne({ room: room._id, userId: cleanUserId });
-  if (!participant) {
-    throw httpError(403, "User is not a participant in this room");
-  }
-
-  return participant;
 }
 
 function clearBidTimer(roomId) {
@@ -180,47 +54,122 @@ function emitToRoom(roomId, event, payload) {
   ioInstance.to(roomId).emit(event, payload);
 }
 
+async function ensureRoomMembership(room, userId) {
+  const cleanUserId = String(userId || "").trim();
+  if (!cleanUserId) {
+    throw httpError(400, "userId is required");
+  }
+
+  const participant = await getParticipantByRoomAndUserId(room.id, cleanUserId);
+  if (!participant) {
+    throw httpError(403, "User is not a participant in this room");
+  }
+
+  return participant;
+}
+
+async function getCurrentQueuePlayer(roomId, queueIndex) {
+  const rows = await dbQuery(
+    `
+    select rpq.player_id, pl.*
+    from room_player_queue rpq
+    join players pl on pl.id = rpq.player_id
+    where rpq.room_id = $1 and rpq.queue_index = $2
+    limit 1
+    `,
+    [roomId, queueIndex]
+  );
+
+  return rows[0] || null;
+}
+
+async function clearTeamLineups(roomId) {
+  await withTransaction(async (client) => {
+    await client.query(
+      `
+      delete from team_playing_eleven
+      where team_id in (select id from teams where room_id = $1)
+      `,
+      [roomId]
+    );
+
+    await client.query(
+      `
+      update teams
+      set playing_eleven_submitted_at = null,
+          updated_at = now()
+      where room_id = $1
+      `,
+      [roomId]
+    );
+  });
+}
+
 async function markNextPlayer(room) {
-  const nextIndex = room.currentPlayerIndex + 1;
+  const nextIndex = toSafeNumber(room.current_player_index) + 1;
+  const queueSize = await countRoomQueue(room.id);
 
-  if (nextIndex >= room.playerQueue.length) {
-    room.status = "completed";
-    room.currentPlayer = null;
-    room.highestBid = 0;
-    room.highestBidder = null;
-    room.bidEndTime = null;
-    await room.save();
-    clearBidTimer(room.roomId);
+  if (nextIndex >= queueSize) {
+    await clearTeamLineups(room.id);
 
-    const state = await getAuctionRoomState(room.roomId);
-    emitToRoom(room.roomId, "auction_end", state.room);
+    await dbQuery(
+      `
+      update auction_rooms
+      set
+        status = 'completed',
+        current_player_id = null,
+        highest_bid = 0,
+        highest_bidder_team_id = null,
+        bid_end_time = null,
+        tournament_winner_team_id = null,
+        tournament_completed_at = null,
+        updated_at = now()
+      where id = $1
+      `,
+      [room.id]
+    );
+
+    clearBidTimer(room.room_id);
+
+    const state = await getAuctionRoomState(room.room_id);
+    emitToRoom(room.room_id, "auction_end", state.room);
     return state;
   }
 
-  const nextPlayer = await Player.findById(room.playerQueue[nextIndex]);
+  const nextPlayer = await getCurrentQueuePlayer(room.id, nextIndex);
   if (!nextPlayer) {
     throw httpError(500, "Auction queue is inconsistent");
   }
 
-  room.currentPlayerIndex = nextIndex;
-  room.currentPlayer = nextPlayer._id;
-  room.highestBid = nextPlayer.basePrice;
-  room.highestBidder = null;
-  room.bidEndTime = new Date(Date.now() + env.auctionStartBidDurationMs);
-  await room.save();
+  const bidEndTime = new Date(Date.now() + env.auctionStartBidDurationMs).toISOString();
 
-  clearBidTimer(room.roomId);
+  await dbQuery(
+    `
+    update auction_rooms
+    set
+      current_player_index = $2,
+      current_player_id = $3,
+      highest_bid = $4,
+      highest_bidder_team_id = null,
+      bid_end_time = $5,
+      updated_at = now()
+    where id = $1
+    `,
+    [room.id, nextIndex, nextPlayer.player_id, toSafeNumber(nextPlayer.base_price), bidEndTime]
+  );
+
+  clearBidTimer(room.room_id);
   const timer = setTimeout(() => {
-    settleCurrentPlayer(room.roomId).catch((error) => {
+    settleCurrentPlayer(room.room_id).catch((error) => {
       // eslint-disable-next-line no-console
-      console.error(`Failed to settle player for room ${room.roomId}`, error);
+      console.error(`Failed to settle player for room ${room.room_id}`, error);
     });
   }, env.auctionStartBidDurationMs);
 
-  roomTimers.set(room.roomId, timer);
+  roomTimers.set(room.room_id, timer);
 
-  const state = await getAuctionRoomState(room.roomId);
-  emitToRoom(room.roomId, "new_player", state.room);
+  const state = await getAuctionRoomState(room.room_id);
+  emitToRoom(room.room_id, "new_player", state.room);
   return state;
 }
 
@@ -228,39 +177,80 @@ async function settleCurrentPlayer(roomId) {
   const normalizedRoomId = normalizeRoomId(roomId);
 
   return queueRoomTask(normalizedRoomId, async () => {
-    const room = await AuctionRoom.findOne({ roomId: normalizedRoomId });
-    if (!room || room.status !== "ongoing" || !room.currentPlayer) {
+    const room = await getRoomByCode(normalizedRoomId);
+    if (!room || room.status !== "ongoing" || !room.current_player_id) {
       return null;
     }
 
-    const currentPlayer = await Player.findById(room.currentPlayer);
+    const currentPlayerRows = await dbQuery("select id from players where id = $1 limit 1", [
+      room.current_player_id
+    ]);
+    const currentPlayer = currentPlayerRows[0];
+
     if (!currentPlayer) {
       throw httpError(500, "Current player missing from database");
     }
 
-    if (room.highestBidder) {
-      const winnerTeam = await Team.findById(room.highestBidder);
+    if (room.highest_bidder_team_id) {
+      const winnerTeamRows = await dbQuery("select * from teams where id = $1 limit 1", [
+        room.highest_bidder_team_id
+      ]);
+      const winnerTeam = winnerTeamRows[0] || null;
 
-      if (winnerTeam && winnerTeam.budget >= room.highestBid) {
-        winnerTeam.players.push(currentPlayer._id);
-        winnerTeam.budget -= room.highestBid;
-        winnerTeam.spent += room.highestBid;
-        await winnerTeam.save();
+      if (winnerTeam && toSafeNumber(winnerTeam.budget) >= toSafeNumber(room.highest_bid)) {
+        await withTransaction(async (client) => {
+          await client.query(
+            `
+            insert into team_players (team_id, player_id, acquired_amount)
+            values ($1, $2, $3)
+            on conflict (team_id, player_id) do nothing
+            `,
+            [winnerTeam.id, currentPlayer.id, toSafeNumber(room.highest_bid)]
+          );
 
-        room.soldPlayers.push({
-          player: currentPlayer._id,
-          team: winnerTeam._id,
-          amount: room.highestBid
+          await client.query(
+            `
+            update teams
+            set
+              budget = budget - $1,
+              spent = spent + $1,
+              updated_at = now()
+            where id = $2
+            `,
+            [toSafeNumber(room.highest_bid), winnerTeam.id]
+          );
+
+          await client.query(
+            `
+            insert into sold_players (room_id, player_id, team_id, amount)
+            values ($1, $2, $3, $4)
+            `,
+            [room.id, currentPlayer.id, winnerTeam.id, toSafeNumber(room.highest_bid)]
+          );
         });
       } else {
-        room.unsoldPlayers.push(currentPlayer._id);
+        await dbQuery(
+          `
+          insert into unsold_players (room_id, player_id)
+          values ($1, $2)
+          on conflict do nothing
+          `,
+          [room.id, currentPlayer.id]
+        );
       }
     } else {
-      room.unsoldPlayers.push(currentPlayer._id);
+      await dbQuery(
+        `
+        insert into unsold_players (room_id, player_id)
+        values ($1, $2)
+        on conflict do nothing
+        `,
+        [room.id, currentPlayer.id]
+      );
     }
 
-    await room.save();
-    return markNextPlayer(room);
+    const refreshed = await getRoomByCode(normalizedRoomId);
+    return markNextPlayer(refreshed);
   });
 }
 
@@ -274,6 +264,11 @@ async function scheduleBidTimer(roomId, durationMs) {
   }, durationMs);
 
   roomTimers.set(roomId, timer);
+}
+
+async function roomCodeExists(roomCode) {
+  const room = await getRoomByCode(roomCode);
+  return Boolean(room);
 }
 
 export function setAuctionIo(io) {
@@ -293,43 +288,75 @@ export async function createAuctionRoom({ userId, userName, teamName, teamColor 
   let roomCode = generateRoomCode();
   for (let attempt = 0; attempt < 5; attempt += 1) {
     // eslint-disable-next-line no-await-in-loop
-    const existing = await AuctionRoom.findOne({ roomId: roomCode });
-    if (!existing) break;
+    const exists = await roomCodeExists(roomCode);
+    if (!exists) break;
     roomCode = generateRoomCode();
   }
 
-  const room = await AuctionRoom.create({
-    roomId: roomCode,
-    creatorUserId: cleanUserId,
-    creatorName: cleanUserName,
-    participants: [cleanUserId],
-    teams: []
+  const result = await withTransaction(async (client) => {
+    const roomInsert = await client.query(
+      `
+      insert into auction_rooms (
+        room_id,
+        creator_user_id,
+        creator_name,
+        status,
+        current_player_index,
+        highest_bid
+      )
+      values ($1, $2, $3, 'waiting', 0, 0)
+      returning *
+      `,
+      [roomCode, cleanUserId, cleanUserName]
+    );
+
+    const room = roomInsert.rows[0];
+
+    const teamInsert = await client.query(
+      `
+      insert into teams (
+        room_id,
+        name,
+        owner_user_id,
+        owner_name,
+        color,
+        budget,
+        spent
+      )
+      values ($1, $2, $3, $4, $5, 100000000, 0)
+      returning *
+      `,
+      [room.id, cleanTeamName, cleanUserId, cleanUserName, safeColor]
+    );
+
+    const team = teamInsert.rows[0];
+
+    await client.query(
+      `
+      insert into participants (
+        room_id,
+        user_id,
+        user_name,
+        team_id,
+        is_host,
+        color
+      )
+      values ($1, $2, $3, $4, true, $5)
+      `,
+      [room.id, cleanUserId, cleanUserName, team.id, safeColor]
+    );
+
+    return {
+      room,
+      teamId: String(team.id)
+    };
   });
 
-  const team = await Team.create({
-    name: cleanTeamName,
-    ownerUserId: cleanUserId,
-    ownerName: cleanUserName,
-    color: safeColor,
-    room: room._id
-  });
+  const state = await getAuctionRoomState(result.room.room_id, cleanUserId);
 
-  await Participant.create({
-    room: room._id,
-    userId: cleanUserId,
-    userName: cleanUserName,
-    team: team._id,
-    isHost: true,
-    color: safeColor
-  });
-
-  room.teams.push(team._id);
-  await room.save();
-
-  const state = await getAuctionRoomState(room.roomId, cleanUserId);
   return {
     room: state.room,
-    teamId: String(team._id)
+    teamId: result.teamId
   };
 }
 
@@ -345,7 +372,7 @@ export async function joinAuctionRoom({ roomId, userId, userName, teamName, team
   }
 
   return queueRoomTask(normalizedRoomId, async () => {
-    const room = await AuctionRoom.findOne({ roomId: normalizedRoomId });
+    const room = await getRoomByCode(normalizedRoomId);
     if (!room) {
       throw httpError(404, "Auction room not found");
     }
@@ -354,59 +381,112 @@ export async function joinAuctionRoom({ roomId, userId, userName, teamName, team
       throw httpError(400, "Room is not accepting new teams");
     }
 
-    const existingParticipant = await Participant.findOne({ room: room._id, userId: cleanUserId }).populate("team");
-    if (existingParticipant) {
-      existingParticipant.userName = cleanUserName;
-      existingParticipant.color = safeColor;
-      await existingParticipant.save();
+    const existingParticipantRows = await dbQuery(
+      `
+      select *
+      from participants
+      where room_id = $1 and user_id = $2
+      limit 1
+      `,
+      [room.id, cleanUserId]
+    );
 
-      const state = await getAuctionRoomState(room.roomId, cleanUserId);
-      emitToRoom(room.roomId, "join_room", state.room);
-      emitToRoom(room.roomId, "participants_update", state.room.participants);
+    const existingParticipant = existingParticipantRows[0] || null;
+
+    if (existingParticipant) {
+      await dbQuery(
+        `
+        update participants
+        set
+          user_name = $2,
+          color = $3,
+          updated_at = now()
+        where id = $1
+        `,
+        [existingParticipant.id, cleanUserName, safeColor]
+      );
+
+      const state = await getAuctionRoomState(room.room_id, cleanUserId);
+      emitToRoom(room.room_id, "join_room", state.room);
+      emitToRoom(room.room_id, "participants_update", state.room.participants);
+
       return {
         room: state.room,
-        teamId: existingParticipant.team ? String(existingParticipant.team._id) : ""
+        teamId: existingParticipant.team_id ? String(existingParticipant.team_id) : ""
       };
     }
 
-    let activeTeam = await Team.findOne({ room: room._id, ownerUserId: cleanUserId });
+    const activeTeamRows = await dbQuery(
+      `
+      select *
+      from teams
+      where room_id = $1 and owner_user_id = $2
+      limit 1
+      `,
+      [room.id, cleanUserId]
+    );
+
+    let activeTeam = activeTeamRows[0] || null;
+
     if (!activeTeam) {
-      activeTeam = await Team.create({
-        name: cleanTeamName,
-        ownerUserId: cleanUserId,
-        ownerName: cleanUserName,
-        color: safeColor,
-        room: room._id
-      });
-      room.teams.push(activeTeam._id);
+      const insertRows = await dbQuery(
+        `
+        insert into teams (
+          room_id,
+          name,
+          owner_user_id,
+          owner_name,
+          color,
+          budget,
+          spent
+        )
+        values ($1, $2, $3, $4, $5, 100000000, 0)
+        returning *
+        `,
+        [room.id, cleanTeamName, cleanUserId, cleanUserName, safeColor]
+      );
+
+      activeTeam = insertRows[0];
     } else {
-      activeTeam.name = cleanTeamName;
-      activeTeam.ownerName = cleanUserName;
-      activeTeam.color = safeColor;
-      await activeTeam.save();
+      const updateRows = await dbQuery(
+        `
+        update teams
+        set
+          name = $2,
+          owner_name = $3,
+          color = $4,
+          updated_at = now()
+        where id = $1
+        returning *
+        `,
+        [activeTeam.id, cleanTeamName, cleanUserName, safeColor]
+      );
+
+      activeTeam = updateRows[0];
     }
 
-    await Participant.create({
-      room: room._id,
-      userId: cleanUserId,
-      userName: cleanUserName,
-      team: activeTeam._id,
-      isHost: false,
-      color: safeColor
-    });
+    await dbQuery(
+      `
+      insert into participants (
+        room_id,
+        user_id,
+        user_name,
+        team_id,
+        is_host,
+        color
+      )
+      values ($1, $2, $3, $4, false, $5)
+      `,
+      [room.id, cleanUserId, cleanUserName, activeTeam.id, safeColor]
+    );
 
-    if (!room.participants.some((participant) => String(participant) === cleanUserId)) {
-      room.participants.push(cleanUserId);
-    }
-    await room.save();
-
-    const state = await getAuctionRoomState(room.roomId, cleanUserId);
-    emitToRoom(room.roomId, "join_room", state.room);
-    emitToRoom(room.roomId, "participants_update", state.room.participants);
+    const state = await getAuctionRoomState(room.room_id, cleanUserId);
+    emitToRoom(room.room_id, "join_room", state.room);
+    emitToRoom(room.room_id, "participants_update", state.room.participants);
 
     return {
       room: state.room,
-      teamId: String(activeTeam._id)
+      teamId: String(activeTeam.id)
     };
   });
 }
@@ -425,13 +505,13 @@ export async function startAuctionForRoom({ roomId, userId }) {
   const cleanUserId = requireText(userId, "userId");
 
   return queueRoomTask(normalizedRoomId, async () => {
-    const room = await AuctionRoom.findOne({ roomId: normalizedRoomId });
+    const room = await getRoomByCode(normalizedRoomId);
 
     if (!room) {
       throw httpError(404, "Auction room not found");
     }
 
-    if (String(room.creatorUserId) !== cleanUserId) {
+    if (String(room.creator_user_id) !== cleanUserId) {
       throw httpError(403, "Only room creator can start the auction");
     }
 
@@ -439,44 +519,79 @@ export async function startAuctionForRoom({ roomId, userId }) {
       throw httpError(400, "Auction is already started or completed");
     }
 
-    if (room.teams.length < 2) {
+    const teamCountRows = await dbQuery(
+      "select count(*)::int as team_count from teams where room_id = $1",
+      [room.id]
+    );
+    const teamCount = toSafeNumber(teamCountRows[0]?.team_count);
+
+    if (teamCount < 2) {
       throw httpError(400, "At least 2 teams are required to start auction");
     }
 
-    const players = await Player.find();
+    const players = await dbQuery("select * from players order by name asc");
     if (!players.length) {
       throw httpError(400, "No players available. Seed players first.");
     }
 
     const queue = shuffleArray(players);
-    room.playerQueue = queue.map((player) => player._id);
-    room.currentPlayerIndex = 0;
-    room.currentPlayer = queue[0]._id;
-    room.highestBid = queue[0].basePrice;
-    room.highestBidder = null;
-    room.bidEndTime = new Date(Date.now() + env.auctionStartBidDurationMs);
-    room.status = "ongoing";
-    await room.save();
 
-    await scheduleBidTimer(room.roomId, env.auctionStartBidDurationMs);
+    await clearTeamLineups(room.id);
 
-    const state = await getAuctionRoomState(room.roomId);
-    emitToRoom(room.roomId, "start_auction", state.room);
-    emitToRoom(room.roomId, "new_player", state.room);
+    await withTransaction(async (client) => {
+      await client.query("delete from room_player_queue where room_id = $1", [room.id]);
+
+      for (let index = 0; index < queue.length; index += 1) {
+        const player = queue[index];
+        // eslint-disable-next-line no-await-in-loop
+        await client.query(
+          `
+          insert into room_player_queue (room_id, queue_index, player_id)
+          values ($1, $2, $3)
+          `,
+          [room.id, index, player.id]
+        );
+      }
+
+      await client.query(
+        `
+        update auction_rooms
+        set
+          current_player_index = 0,
+          current_player_id = $2,
+          highest_bid = $3,
+          highest_bidder_team_id = null,
+          bid_end_time = $4,
+          status = 'ongoing',
+          tournament_winner_team_id = null,
+          tournament_completed_at = null,
+          updated_at = now()
+        where id = $1
+        `,
+        [
+          room.id,
+          queue[0].id,
+          toSafeNumber(queue[0].base_price),
+          new Date(Date.now() + env.auctionStartBidDurationMs).toISOString()
+        ]
+      );
+    });
+
+    await scheduleBidTimer(room.room_id, env.auctionStartBidDurationMs);
+
+    const state = await getAuctionRoomState(room.room_id);
+    emitToRoom(room.room_id, "start_auction", state.room);
+    emitToRoom(room.room_id, "new_player", state.room);
 
     return state;
   });
-}
-
-function isMemberTeam(room, teamId) {
-  return room.teams.some((id) => String(id) === String(teamId));
 }
 
 export async function placeBidForRoom({ roomId, teamId, amount, userId }) {
   const normalizedRoomId = normalizeRoomId(roomId);
   const cleanUserId = requireText(userId, "userId");
 
-  if (!mongoose.Types.ObjectId.isValid(teamId)) {
+  if (!isUuid(teamId)) {
     throw httpError(400, "Invalid teamId");
   }
 
@@ -486,7 +601,7 @@ export async function placeBidForRoom({ roomId, teamId, amount, userId }) {
   }
 
   return queueRoomTask(normalizedRoomId, async () => {
-    const room = await AuctionRoom.findOne({ roomId: normalizedRoomId }).populate("currentPlayer");
+    const room = await getRoomByCode(normalizedRoomId);
     if (!room) {
       throw httpError(404, "Auction room not found");
     }
@@ -495,63 +610,83 @@ export async function placeBidForRoom({ roomId, teamId, amount, userId }) {
       throw httpError(400, "Auction is not ongoing");
     }
 
-    if (!room.currentPlayer) {
+    if (!room.current_player_id) {
       throw httpError(400, "No active player is currently on auction");
     }
 
-    if (!isMemberTeam(room, teamId)) {
-      throw httpError(403, "Team does not belong to this room");
-    }
+    const teamRows = await dbQuery("select * from teams where id = $1 limit 1", [teamId]);
+    const team = teamRows[0] || null;
 
-    const team = await Team.findById(teamId);
     if (!team) {
       throw httpError(404, "Team not found");
     }
 
-    if (String(team.room) !== String(room._id)) {
+    if (String(team.room_id) !== String(room.id)) {
       throw httpError(403, "Team does not belong to this room");
     }
 
-    if (String(team.ownerUserId) !== cleanUserId) {
+    if (String(team.owner_user_id) !== cleanUserId) {
       throw httpError(403, "You can only bid for your own team");
     }
 
-    if (team.budget < bidAmount) {
+    if (toSafeNumber(team.budget) < bidAmount) {
       throw httpError(400, "Insufficient team budget");
     }
 
+    const currentPlayerRows = await dbQuery("select base_price from players where id = $1 limit 1", [
+      room.current_player_id
+    ]);
+    const currentPlayer = currentPlayerRows[0] || null;
+
+    if (!currentPlayer) {
+      throw httpError(400, "Current player is unavailable");
+    }
+
     const minIncrement = 100000;
-    const minimumBid = room.highestBidder
-      ? room.highestBid + minIncrement
-      : room.currentPlayer.basePrice;
+    const minimumBid = room.highest_bidder_team_id
+      ? toSafeNumber(room.highest_bid) + minIncrement
+      : toSafeNumber(currentPlayer.base_price);
 
     if (bidAmount < minimumBid) {
       throw httpError(400, `Minimum valid bid is ${minimumBid}`);
     }
 
-    room.highestBid = bidAmount;
-    room.highestBidder = team._id;
-    room.bidEndTime = new Date(Date.now() + env.auctionBidDurationMs);
-    await room.save();
+    const nextBidEnd = new Date(Date.now() + env.auctionBidDurationMs).toISOString();
 
-    await scheduleBidTimer(room.roomId, env.auctionBidDurationMs);
+    await dbQuery(
+      `
+      update auction_rooms
+      set
+        highest_bid = $2,
+        highest_bidder_team_id = $3,
+        bid_end_time = $4,
+        updated_at = now()
+      where id = $1
+      `,
+      [room.id, bidAmount, team.id, nextBidEnd]
+    );
 
-    const state = await getAuctionRoomState(room.roomId);
-    emitToRoom(room.roomId, "place_bid", {
-      roomId: room.roomId,
-      teamId: String(team._id),
+    await scheduleBidTimer(room.room_id, env.auctionBidDurationMs);
+
+    const state = await getAuctionRoomState(room.room_id);
+    emitToRoom(room.room_id, "place_bid", {
+      roomId: room.room_id,
+      teamId: String(team.id),
       teamName: team.name,
       amount: bidAmount,
       color: normalizeColor(team.color),
-      bidEndTime: room.bidEndTime
+      bidEndTime: nextBidEnd
     });
-    emitToRoom(room.roomId, "update_bid", state.room);
+    emitToRoom(room.room_id, "update_bid", state.room);
+
     return state;
   });
 }
 
 export async function getAuctionRoomState(roomId, userId) {
-  const room = await hydrateRoomByCode(roomId);
+  const normalizedRoomId = normalizeRoomId(roomId);
+  const room = await getRoomByCode(normalizedRoomId);
+
   if (!room) {
     throw httpError(404, "Auction room not found");
   }
@@ -560,26 +695,40 @@ export async function getAuctionRoomState(roomId, userId) {
     await ensureRoomMembership(room, userId);
   }
 
-  const participants = await getRoomParticipants(room._id);
-  return { room: buildRoomPayload(room, participants) };
+  const payload = await buildRoomPayloadFromRow(room);
+  return { room: payload };
 }
 
 export async function getLatestRoomForUser(userId) {
   const cleanUserId = requireText(userId, "userId");
-  const participants = await Participant.find({ userId: cleanUserId })
-    .populate("room")
-    .populate("team")
-    .sort({ updatedAt: -1 });
 
-  const participant = participants.find((entry) => entry.room && entry.room.status !== "completed") || participants[0];
+  const participantRows = await dbQuery(
+    `
+    select
+      p.team_id,
+      r.room_id,
+      r.status,
+      p.updated_at
+    from participants p
+    join auction_rooms r on r.id = p.room_id
+    where p.user_id = $1
+    order by p.updated_at desc
+    `,
+    [cleanUserId]
+  );
 
-  if (!participant || !participant.room) {
+  const participant =
+    participantRows.find((entry) => entry.status && entry.status !== "completed") ||
+    participantRows[0] ||
+    null;
+
+  if (!participant) {
     return { room: null, teamId: "" };
   }
 
-  const state = await getAuctionRoomState(participant.room.roomId, cleanUserId);
+  const state = await getAuctionRoomState(participant.room_id, cleanUserId);
   return {
     room: state.room,
-    teamId: participant.team ? String(participant.team._id) : ""
+    teamId: participant.team_id ? String(participant.team_id) : ""
   };
 }

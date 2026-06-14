@@ -1,11 +1,27 @@
 ﻿import { createServer } from "node:http";
-import { MongoMemoryServer } from "mongodb-memory-server";
 import app from "./app.js";
-import { connectDatabase } from "./config/db.js";
+import { closeDatabase, connectDatabase } from "./config/db.js";
 import { env } from "./config/env.js";
 import { initializeAuctionSocket } from "./socket/auctionSocket.js";
 
-let inMemoryMongoServer = null;
+function getDatabaseErrorHint(error) {
+  const message = String(error?.message || "");
+  const code = String(error?.code || "").toUpperCase();
+
+  if (code === "ENOTFOUND" && message.includes("db.")) {
+    return "The direct Supabase DB host is often IPv6-only. Use the Supabase Session/Transaction Pooler connection string (IPv4) in SUPABASE_DB_URL.";
+  }
+
+  if (code === "28P01") {
+    return "Database authentication failed. Verify the database password in SUPABASE_DB_URL (or SUPABASE_DB_PASSWORD).";
+  }
+
+  if (code === "3D000") {
+    return "Database name is invalid. For Supabase, use /postgres unless you created a custom DB name.";
+  }
+
+  return "";
+}
 
 function sleep(ms) {
   return new Promise((resolve) => {
@@ -14,8 +30,7 @@ function sleep(ms) {
 }
 
 async function connectDatabaseWithRetry({
-  mongoUri,
-  serverSelectionTimeoutMs,
+  connectionString,
   retryDelayMs,
   maxRetries
 }) {
@@ -26,15 +41,17 @@ async function connectDatabaseWithRetry({
     console.log(`Connecting to database (attempt ${attempt})...`);
 
     try {
-      await connectDatabase(mongoUri, { serverSelectionTimeoutMS: serverSelectionTimeoutMs });
+      await connectDatabase(connectionString);
       // eslint-disable-next-line no-console
       console.log("Database connected");
       return;
     } catch (error) {
+      const hint = getDatabaseErrorHint(error);
       // eslint-disable-next-line no-console
       console.error(
         `Database connection failed. Retrying in ${retryDelayMs / 1000}s...`,
-        error?.message || error
+        error?.message || error,
+        hint ? `Hint: ${hint}` : ""
       );
 
       if (maxRetries !== 0 && attempt >= maxRetries) {
@@ -46,31 +63,7 @@ async function connectDatabaseWithRetry({
     }
   }
 
-  throw new Error(`Unable to connect to MongoDB after ${maxRetries} attempts`);
-}
-
-async function connectInMemoryDatabase(serverSelectionTimeoutMs) {
-  // eslint-disable-next-line no-console
-  console.warn("Starting in-memory MongoDB fallback...");
-
-  inMemoryMongoServer = await MongoMemoryServer.create();
-  const memoryUri = inMemoryMongoServer.getUri("ipl-auction-sim");
-
-  await connectDatabase(memoryUri, {
-    serverSelectionTimeoutMS: serverSelectionTimeoutMs
-  });
-
-  // eslint-disable-next-line no-console
-  console.log("In-memory MongoDB connected");
-}
-
-async function stopInMemoryDatabase() {
-  if (!inMemoryMongoServer) {
-    return;
-  }
-
-  await inMemoryMongoServer.stop();
-  inMemoryMongoServer = null;
+  throw new Error(`Unable to connect to Supabase Postgres after ${maxRetries} attempts`);
 }
 
 function startHttpServer(httpServer, port) {
@@ -95,28 +88,15 @@ async function shutdown(server, signal) {
     server.close(resolve);
   });
 
-  await stopInMemoryDatabase();
+  await closeDatabase();
 }
 
 async function bootstrap() {
-  try {
-    await connectDatabaseWithRetry({
-      mongoUri: env.mongoUri,
-      serverSelectionTimeoutMs: env.mongoServerSelectionTimeoutMs,
-      retryDelayMs: env.mongoRetryDelayMs,
-      maxRetries: env.mongoMaxRetries
-    });
-  } catch (connectionError) {
-    if (!env.mongoMemoryFallback) {
-      throw connectionError;
-    }
-
-    // eslint-disable-next-line no-console
-    console.warn(
-      "Primary MongoDB is unavailable. Falling back to in-memory MongoDB for this session."
-    );
-    await connectInMemoryDatabase(env.mongoServerSelectionTimeoutMs);
-  }
+  await connectDatabaseWithRetry({
+    connectionString: env.supabaseDbUrl,
+    retryDelayMs: env.dbRetryDelayMs,
+    maxRetries: env.dbMaxRetries
+  });
 
   const httpServer = createServer(app);
   initializeAuctionSocket(httpServer);
@@ -150,7 +130,7 @@ async function bootstrap() {
 
 bootstrap()
   .catch(async (error) => {
-    await stopInMemoryDatabase();
+    await closeDatabase();
     // eslint-disable-next-line no-console
     console.error("Failed to start server", error);
     process.exit(1);

@@ -1,12 +1,11 @@
-import Match from "../models/Match.js";
 import {
   buildLeagueSchedule,
   buildPlayoffs,
   calculatePointsTable,
+  getRoomSchedule,
   simulateScheduledMatchById
 } from "../services/tournamentService.js";
 import { getAuctionRoomState } from "../services/auctionService.js";
-import { findRoomByIdOrCode } from "../utils/roomLookup.js";
 
 export async function createLeagueSchedule(req, res, next) {
   try {
@@ -29,8 +28,7 @@ export async function getSchedule(req, res, next) {
       return res.status(400).json({ message: "userId query parameter is required" });
     }
     await getAuctionRoomState(roomId, userId);
-    const room = await findRoomByIdOrCode(roomId);
-    const matches = await Match.find({ room: room._id }).sort({ createdAt: 1 }).populate("team1 team2");
+    const matches = await getRoomSchedule(roomId, userId);
     res.json({ matches });
   } catch (error) {
     next(error);
@@ -70,6 +68,9 @@ export async function getPointsTable(req, res, next) {
     const { roomId, userId } = req.query;
     if (!userId) {
       return res.status(400).json({ message: "userId query parameter is required" });
+    }
+    if (!roomId) {
+      return res.status(400).json({ message: "roomId query parameter is required" });
     }
     const pointsTable = await calculatePointsTable(roomId, userId);
     res.json({ pointsTable });

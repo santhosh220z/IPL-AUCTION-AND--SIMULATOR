@@ -1,10 +1,14 @@
-import Match from "../models/Match.js";
-import Participant from "../models/Participant.js";
-import Team from "../models/Team.js";
+import { dbQuery, withTransaction } from "../config/db.js";
 import { findRoomByIdOrCode } from "../utils/roomLookup.js";
 import { httpError } from "../utils/httpError.js";
 import { simulateMatchBetweenTeams } from "../utils/simulator.js";
 import { getAuctionIo } from "./auctionService.js";
+import {
+  getParticipantByRoomAndUserId,
+  getPopulatedMatches,
+  getTeamWithPlayers,
+  toSafeNumber
+} from "./sqlData.js";
 
 function parseOversToBalls(oversString) {
   const [oversPart, ballsPart] = String(oversString || "0.0").split(".");
@@ -15,9 +19,9 @@ function parseOversToBalls(oversString) {
 
 function pointsRow(team) {
   return {
-    teamId: String(team._id),
+    teamId: String(team.id),
     teamName: team.name,
-    owner: team.ownerName || "",
+    owner: team.owner_name || "",
     played: 0,
     won: 0,
     lost: 0,
@@ -37,8 +41,22 @@ function computeNrr(row) {
   return Number((runRateFor - runRateAgainst).toFixed(3));
 }
 
-async function populateTeams(teamIds) {
-  return Team.find({ _id: { $in: teamIds } });
+function getWinnerAndLoser(match) {
+  if (!match.winner_team_id) return { winnerId: null, loserId: null };
+
+  const winnerId = String(match.winner_team_id);
+  const team1Id = String(match.team1_id);
+  const team2Id = String(match.team2_id);
+  const loserId = winnerId === team1Id ? team2Id : team1Id;
+
+  return { winnerId, loserId };
+}
+
+function resolveTeamPlayersForSimulation(team) {
+  if (team.playingElevenSubmittedAt && (team.playingEleven || []).length === 11) {
+    return team.playingEleven;
+  }
+  return team.players;
 }
 
 async function requireRoomParticipant(room, userId) {
@@ -47,135 +65,221 @@ async function requireRoomParticipant(room, userId) {
     throw httpError(400, "userId is required");
   }
 
-  const participant = await Participant.findOne({ room: room._id, userId: cleanUserId });
+  const participant = await getParticipantByRoomAndUserId(room.id, cleanUserId);
   if (!participant) {
     throw httpError(403, "You are not a participant in this room");
   }
 }
 
-function getWinnerAndLoser(match) {
-  if (!match.winner) return { winnerId: null, loserId: null };
-  const winnerId = String(match.winner);
-  const team1Id = String(match.team1);
-  const team2Id = String(match.team2);
-  const loserId = winnerId === team1Id ? team2Id : team1Id;
-  return { winnerId, loserId };
+async function getTeamsForRoom(roomId) {
+  return dbQuery("select id, name, owner_name from teams where room_id = $1 order by created_at asc", [
+    roomId
+  ]);
+}
+
+async function getLeagueMatches(roomId) {
+  return dbQuery(
+    "select * from matches where room_id = $1 and stage = 'league' order by created_at asc",
+    [roomId]
+  );
+}
+
+export async function getRoomSchedule(roomIdOrCode, userId) {
+  const room = await findRoomByIdOrCode(roomIdOrCode);
+  await requireRoomParticipant(room, userId);
+
+  const rows = await dbQuery("select * from matches where room_id = $1 order by created_at asc", [room.id]);
+  return getPopulatedMatches(rows);
 }
 
 export async function buildLeagueSchedule(roomIdOrCode, userId) {
   const room = await findRoomByIdOrCode(roomIdOrCode);
   await requireRoomParticipant(room, userId);
-  const existing = await Match.find({ room: room._id, stage: "league" }).populate("team1 team2");
 
+  const existing = await getLeagueMatches(room.id);
   if (existing.length > 0) {
-    return existing;
+    return getPopulatedMatches(existing);
   }
 
-  const teamIds = room.teams.map((id) => String(id));
-  if (teamIds.length < 2) {
+  const teams = await getTeamsForRoom(room.id);
+  if (teams.length < 2) {
     throw httpError(400, "At least two teams are needed for scheduling");
   }
 
   const fixtures = [];
-  for (let i = 0; i < teamIds.length; i += 1) {
-    for (let j = i + 1; j < teamIds.length; j += 1) {
+  for (let i = 0; i < teams.length; i += 1) {
+    for (let j = i + 1; j < teams.length; j += 1) {
       fixtures.push({
-        room: room._id,
-        team1: teamIds[i],
-        team2: teamIds[j],
+        roomId: room.id,
+        team1Id: teams[i].id,
+        team2Id: teams[j].id,
         stage: "league",
         status: "scheduled"
       });
     }
   }
 
-  const created = await Match.insertMany(fixtures);
-  return Match.find({ _id: { $in: created.map((match) => match._id) } }).populate("team1 team2");
+  const insertedMatchIds = await withTransaction(async (client) => {
+    const ids = [];
+
+    for (const fixture of fixtures) {
+      // eslint-disable-next-line no-await-in-loop
+      const inserted = await client.query(
+        `
+        insert into matches (room_id, team1_id, team2_id, stage, status)
+        values ($1, $2, $3, $4, $5)
+        returning id
+        `,
+        [fixture.roomId, fixture.team1Id, fixture.team2Id, fixture.stage, fixture.status]
+      );
+
+      ids.push(inserted.rows[0].id);
+    }
+
+    return ids;
+  });
+
+  const createdRows = insertedMatchIds.length
+    ? await dbQuery("select * from matches where id = any($1::uuid[])", [insertedMatchIds])
+    : [];
+
+  return getPopulatedMatches(createdRows);
 }
 
 export async function simulateScheduledMatchById(matchId, userId) {
-  const match = await Match.findById(matchId).populate([
-    { path: "team1", populate: { path: "players" } },
-    { path: "team2", populate: { path: "players" } }
-  ]);
+  const matchRows = await dbQuery("select * from matches where id = $1 limit 1", [matchId]);
+  const match = matchRows[0] || null;
 
   if (!match) {
     throw httpError(404, "Match not found");
   }
 
-  const room = await findRoomByIdOrCode(String(match.room));
+  const room = await findRoomByIdOrCode(String(match.room_id));
   await requireRoomParticipant(room, userId);
 
   if (match.status === "completed") {
-    return match;
+    const populated = await getPopulatedMatches([match]);
+    return populated[0] || null;
   }
 
-  if (match.team1.players.length < 2 || match.team2.players.length < 2) {
+  const [team1, team2] = await Promise.all([
+    getTeamWithPlayers(match.team1_id),
+    getTeamWithPlayers(match.team2_id)
+  ]);
+
+  if (!team1 || !team2) {
+    throw httpError(404, "Scheduled match teams are missing");
+  }
+
+  const simTeam1 = {
+    _id: team1.id,
+    name: team1.name,
+    players: resolveTeamPlayersForSimulation(team1)
+  };
+
+  const simTeam2 = {
+    _id: team2.id,
+    name: team2.name,
+    players: resolveTeamPlayersForSimulation(team2)
+  };
+
+  if (simTeam1.players.length < 2 || simTeam2.players.length < 2) {
     throw httpError(400, "Both teams need at least 2 players before simulating this match");
   }
 
-  const simulation = simulateMatchBetweenTeams(match.team1, match.team2);
+  const simulation = simulateMatchBetweenTeams(simTeam1, simTeam2);
 
   let winner = null;
-  if (simulation.winner === "team1") winner = match.team1._id;
-  if (simulation.winner === "team2") winner = match.team2._id;
+  if (simulation.winner === "team1") winner = team1.id;
+  if (simulation.winner === "team2") winner = team2.id;
 
-  match.status = "completed";
-  match.scorecard = simulation;
-  match.result = simulation.result;
-  match.winner = winner;
-  match.team1Runs = simulation.innings1.runs;
-  match.team1Wickets = simulation.innings1.wickets;
-  match.team1Overs = simulation.innings1.overs;
-  match.team2Runs = simulation.innings2.runs;
-  match.team2Wickets = simulation.innings2.wickets;
-  match.team2Overs = simulation.innings2.overs;
-  await match.save();
+  const updatedRows = await dbQuery(
+    `
+    update matches
+    set
+      status = 'completed',
+      scorecard = $2::jsonb,
+      result = $3,
+      winner_team_id = $4,
+      team1_runs = $5,
+      team1_wickets = $6,
+      team1_overs = $7,
+      team2_runs = $8,
+      team2_wickets = $9,
+      team2_overs = $10,
+      updated_at = now()
+    where id = $1
+    returning *
+    `,
+    [
+      match.id,
+      JSON.stringify(simulation),
+      simulation.result,
+      winner,
+      simulation.innings1.runs,
+      simulation.innings1.wickets,
+      simulation.innings1.overs,
+      simulation.innings2.runs,
+      simulation.innings2.wickets,
+      simulation.innings2.overs
+    ]
+  );
+
+  const updatedMatch = updatedRows[0];
+  const populated = await getPopulatedMatches([updatedMatch]);
+  const populatedMatch = populated[0] || null;
 
   const io = getAuctionIo();
   if (io) {
-    io.to(room.roomId).emit("match_update", {
+    io.to(room.room_id).emit("match_update", {
       type: "scheduled_match_completed",
-      roomId: room.roomId,
-      match
+      roomId: room.room_id,
+      match: populatedMatch
     });
   }
 
-  return match;
+  return populatedMatch;
 }
 
 export async function calculatePointsTable(roomIdOrCode, userId) {
   const room = await findRoomByIdOrCode(roomIdOrCode);
   await requireRoomParticipant(room, userId);
-  const teams = await populateTeams(room.teams);
-  const teamMap = new Map(teams.map((team) => [String(team._id), pointsRow(team)]));
 
-  const completedMatches = await Match.find({
-    room: room._id,
-    status: "completed",
-    stage: { $in: ["league", "qualifier1", "eliminator", "qualifier2", "final"] }
-  });
+  const teams = await getTeamsForRoom(room.id);
+  const teamMap = new Map(teams.map((team) => [String(team.id), pointsRow(team)]));
+
+  const completedMatches = await dbQuery(
+    `
+    select *
+    from matches
+    where room_id = $1
+      and status = 'completed'
+      and stage = any($2::text[])
+    order by created_at asc
+    `,
+    [room.id, ["league", "qualifier1", "eliminator", "qualifier2", "final"]]
+  );
 
   for (const match of completedMatches) {
-    const team1 = teamMap.get(String(match.team1));
-    const team2 = teamMap.get(String(match.team2));
+    const team1 = teamMap.get(String(match.team1_id));
+    const team2 = teamMap.get(String(match.team2_id));
     if (!team1 || !team2) continue;
 
     team1.played += 1;
     team2.played += 1;
 
-    team1.runsFor += match.team1Runs;
-    team1.runsAgainst += match.team2Runs;
-    team1.ballsFaced += parseOversToBalls(match.team1Overs);
-    team1.ballsBowled += parseOversToBalls(match.team2Overs);
+    team1.runsFor += toSafeNumber(match.team1_runs);
+    team1.runsAgainst += toSafeNumber(match.team2_runs);
+    team1.ballsFaced += parseOversToBalls(match.team1_overs);
+    team1.ballsBowled += parseOversToBalls(match.team2_overs);
 
-    team2.runsFor += match.team2Runs;
-    team2.runsAgainst += match.team1Runs;
-    team2.ballsFaced += parseOversToBalls(match.team2Overs);
-    team2.ballsBowled += parseOversToBalls(match.team1Overs);
+    team2.runsFor += toSafeNumber(match.team2_runs);
+    team2.runsAgainst += toSafeNumber(match.team1_runs);
+    team2.ballsFaced += parseOversToBalls(match.team2_overs);
+    team2.ballsBowled += parseOversToBalls(match.team1_overs);
 
-    if (match.winner) {
-      const winnerId = String(match.winner);
+    if (match.winner_team_id) {
+      const winnerId = String(match.winner_team_id);
       if (winnerId === team1.teamId) {
         team1.won += 1;
         team2.lost += 1;
@@ -207,37 +311,51 @@ export async function calculatePointsTable(roomIdOrCode, userId) {
 export async function buildPlayoffs(roomIdOrCode, userId) {
   const room = await findRoomByIdOrCode(roomIdOrCode);
   await requireRoomParticipant(room, userId);
-  const table = await calculatePointsTable(room._id, userId);
+  const table = await calculatePointsTable(room.id, userId);
 
   if (table.length < 4) {
     throw httpError(400, "At least 4 teams are needed for IPL-style playoffs");
   }
 
   const playoffStages = ["qualifier1", "eliminator", "qualifier2", "final"];
-  const existing = await Match.find({
-    room: room._id,
-    stage: { $in: playoffStages }
-  }).sort({ createdAt: 1 });
+  const existing = await dbQuery(
+    `
+    select *
+    from matches
+    where room_id = $1 and stage = any($2::text[])
+    order by created_at asc
+    `,
+    [room.id, playoffStages]
+  );
 
   if (!existing.length) {
-    const created = await Match.insertMany([
-      {
-        room: room._id,
-        team1: table[0].teamId,
-        team2: table[1].teamId,
-        stage: "qualifier1",
-        status: "scheduled"
-      },
-      {
-        room: room._id,
-        team1: table[2].teamId,
-        team2: table[3].teamId,
-        stage: "eliminator",
-        status: "scheduled"
-      }
+    const insertedMatchIds = await withTransaction(async (client) => {
+      const qualifier1 = await client.query(
+        `
+        insert into matches (room_id, team1_id, team2_id, stage, status)
+        values ($1, $2, $3, 'qualifier1', 'scheduled')
+        returning id
+        `,
+        [room.id, table[0].teamId, table[1].teamId]
+      );
+
+      const eliminator = await client.query(
+        `
+        insert into matches (room_id, team1_id, team2_id, stage, status)
+        values ($1, $2, $3, 'eliminator', 'scheduled')
+        returning id
+        `,
+        [room.id, table[2].teamId, table[3].teamId]
+      );
+
+      return [qualifier1.rows[0].id, eliminator.rows[0].id];
+    });
+
+    const created = await dbQuery("select * from matches where id = any($1::uuid[])", [
+      insertedMatchIds
     ]);
 
-    return Match.find({ _id: { $in: created.map((match) => match._id) } }).populate("team1 team2 winner");
+    return getPopulatedMatches(created);
   }
 
   const byStage = new Map(existing.map((match) => [match.stage, match]));
@@ -254,47 +372,71 @@ export async function buildPlayoffs(roomIdOrCode, userId) {
       throw httpError(400, "Playoff prerequisites are incomplete");
     }
 
-    await Match.create({
-      room: room._id,
-      team1: q1.loserId,
-      team2: elim.winnerId,
-      stage: "qualifier2",
-      status: "scheduled"
-    });
+    await dbQuery(
+      `
+      insert into matches (room_id, team1_id, team2_id, stage, status)
+      values ($1, $2, $3, 'qualifier2', 'scheduled')
+      `,
+      [room.id, q1.loserId, elim.winnerId]
+    );
   }
 
-  if (qualifier1?.status === "completed" && qualifier2?.status === "completed" && !final) {
-    const q1Winner = getWinnerAndLoser(qualifier1).winnerId;
-    const q2Winner = getWinnerAndLoser(qualifier2).winnerId;
+  const refreshedAfterQ2 = await dbQuery(
+    `
+    select *
+    from matches
+    where room_id = $1 and stage = any($2::text[])
+    order by created_at asc
+    `,
+    [room.id, playoffStages]
+  );
+
+  const byStageAfterQ2 = new Map(refreshedAfterQ2.map((match) => [match.stage, match]));
+  const qualifier1Updated = byStageAfterQ2.get("qualifier1");
+  const qualifier2Updated = byStageAfterQ2.get("qualifier2");
+  const finalUpdated = byStageAfterQ2.get("final");
+
+  if (
+    qualifier1Updated?.status === "completed" &&
+    qualifier2Updated?.status === "completed" &&
+    !finalUpdated
+  ) {
+    const q1Winner = getWinnerAndLoser(qualifier1Updated).winnerId;
+    const q2Winner = getWinnerAndLoser(qualifier2Updated).winnerId;
 
     if (!q1Winner || !q2Winner) {
       throw httpError(400, "Final prerequisites are incomplete");
     }
 
-    await Match.create({
-      room: room._id,
-      team1: q1Winner,
-      team2: q2Winner,
-      stage: "final",
-      status: "scheduled"
-    });
+    await dbQuery(
+      `
+      insert into matches (room_id, team1_id, team2_id, stage, status)
+      values ($1, $2, $3, 'final', 'scheduled')
+      `,
+      [room.id, q1Winner, q2Winner]
+    );
   }
 
-  const refreshed = await Match.find({
-    room: room._id,
-    stage: { $in: playoffStages }
-  })
-    .populate("team1 team2 winner")
-    .sort({ createdAt: 1 });
+  const refreshed = await dbQuery(
+    `
+    select *
+    from matches
+    where room_id = $1 and stage = any($2::text[])
+    order by created_at asc
+    `,
+    [room.id, playoffStages]
+  );
+
+  const populated = await getPopulatedMatches(refreshed);
 
   const io = getAuctionIo();
   if (io) {
-    io.to(room.roomId).emit("match_update", {
+    io.to(room.room_id).emit("match_update", {
       type: "playoff_schedule_updated",
-      roomId: room.roomId,
-      playoffMatches: refreshed
+      roomId: room.room_id,
+      playoffMatches: populated
     });
   }
 
-  return refreshed;
+  return populated;
 }

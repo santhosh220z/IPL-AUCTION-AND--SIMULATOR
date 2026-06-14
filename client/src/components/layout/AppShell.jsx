@@ -9,17 +9,26 @@ export default function AppShell({ children }) {
   const userId = useAuctionStore((state) => state.userId);
   const userName = useAuctionStore((state) => state.userName);
   const currentRoomId = useAuctionStore((state) => state.currentRoomId);
+  const roomStatus = useAuctionStore((state) => state.room?.status);
   const setRoom = useAuctionStore((state) => state.setRoom);
   const setCurrentTeamId = useAuctionStore((state) => state.setCurrentTeamId);
   const resetAuctionState = useAuctionStore((state) => state.resetAuctionState);
   const hasAttemptedRejoin = useRef(false);
 
   const navItems = [
-    { to: "/", label: "Home" },
-    { to: currentRoomId ? `/auction/${currentRoomId}` : "/", label: "Auction" },
-    { to: "/team", label: "Team Management" },
-    { to: "/match", label: "Match Simulator" },
-    { to: "/standings", label: "Standings" }
+    { label: "Home", to: "/", end: true },
+    {
+      label: "Auction",
+      to: currentRoomId ? `/auction/${currentRoomId}` : "",
+      end: true,
+      disabled: !currentRoomId
+    },
+    {
+      label: "Match Simulator",
+      to: "/match",
+      end: true,
+      disabled: roomStatus !== "completed"
+    }
   ];
 
   function handleLeaveRoom() {
@@ -72,17 +81,28 @@ export default function AppShell({ children }) {
 
           <nav className="flex flex-wrap gap-2">
             {navItems.map((item) => (
-              <NavLink
-                key={item.to}
-                to={item.to}
-                className={({ isActive }) =>
-                  `rounded-lg px-3 py-2 text-sm font-semibold transition ${
-                    isActive ? "bg-ember-500 text-black" : "bg-storm-100/60 text-storm-900 hover:bg-storm-200"
-                  }`
-                }
-              >
-                {item.label}
-              </NavLink>
+              item.disabled ? (
+                <span
+                  key={item.label}
+                  className="rounded-lg bg-storm-100/40 px-3 py-2 text-sm font-semibold text-storm-600"
+                  title={item.label === "Match Simulator" ? "Complete the auction to unlock match simulation" : "Join a room first"}
+                >
+                  {item.label}
+                </span>
+              ) : (
+                <NavLink
+                  key={item.label}
+                  to={item.to}
+                  end={item.end}
+                  className={({ isActive }) =>
+                    `rounded-lg px-3 py-2 text-sm font-semibold transition ${
+                      isActive ? "bg-ember-500 text-black" : "bg-storm-100/60 text-storm-900 hover:bg-storm-200"
+                    }`
+                  }
+                >
+                  {item.label}
+                </NavLink>
+              )
             ))}
           </nav>
 
